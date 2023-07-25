@@ -31,7 +31,7 @@ const Const = {
 };
 
 let DEVICEINFO = [
-  {
+  /*{
     id : "BANGLEJS",
     name : "Bangle.js 1",
     features : ["BLE","BLEHID","GRAPHICS","ACCEL","MAG"],
@@ -59,12 +59,18 @@ let DEVICEINFO = [
     name : "MDBT42Q",
     features : ["BLE","BLEHID"],
     img : "https://www.espruino.com/img/MDBT42Q_thumb.jpg"
-  }/*, {
+  }, {
     id : "MICROBIT",
     name : "micro:bit",
     features : ["BLE","BLEHID"],
     img : "https://www.espruino.com/img/MICROBIT_thumb.jpg"
   }*/
+  {
+    id : "PINETIME40",
+    name : "PineTime 40",
+    features : ["BLE","BLEHID","GRAPHICS","ACCEL","TOUCH"],
+    img : "https://www.joaquim.org/wp-content/uploads/2023/06/IMG_20230630_163613-920x422.jpg"
+  }
 ];
 
 /* When a char is not in Espruino's codepage, try and use
