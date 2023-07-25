@@ -1,12 +1,14 @@
 let appJSON = []; // List of apps and info from apps.json
 let appSortInfo = {}; // list of data to sort by, from appdates.csv { created, modified }
+let appCounts = {};
 let files = []; // list of files on the Espruimo Device
 const DEFAULTSETTINGS = {
   pretokenise : true,
-  favourites : ["boot","launch","setting"],
+  minify : false,  // disabled by default due to https://github.com/espruino/BangleApps/pull/355#issuecomment-620124162
+  favourites : ["launch"],
   language : "",
   bleCompat: false, // 20 byte MTU BLE Compatibility mode
-  sendUsageStats: false  // send usage stats to banglejs.com
+  sendUsageStats: true  // send usage stats to banglejs.com
 };
 var SETTINGS = JSON.parse(JSON.stringify(DEFAULTSETTINGS)); // clone
 
@@ -48,6 +50,14 @@ function appJSONLoadedHandler() {
   // finally update what we're showing
   promise.then(function() {
     refreshLibrary();
+    // if ?id=...&readme is in URL, show it
+    if (window.location.search) {
+      let searchParams = new URLSearchParams(window.location.search);
+      if (searchParams.has("id") && searchParams.has("readme")) {
+        var id = searchParams.get("id").toLowerCase();
+        showReadme(null, id);
+      }
+    }
   });
 }
 
@@ -69,7 +79,8 @@ httpGet(Const.APPS_JSON_FILE).then(apps=>{
 }).catch(error=>{
   console.warn("APPS FILE NOT FOUND "+Const.APPS_JSON_FILE);
   console.log("Attempting search - SLOW");
-  let appsURL = window.location.origin+window.location.pathname+"apps";
+  let baseurl = window.location.href.replace(/\/[^/]*$/,"/");
+  let appsURL = baseurl+"apps";
   httpGet(appsURL).then(htmlText=>{
     showToast(Const.APPS_JSON_FILE+" can't be read, scanning 'apps' folder for apps","warning");
     var parser = new DOMParser();
@@ -131,14 +142,18 @@ if (Const.APP_USAGE_JSON) httpGet(Const.APP_USAGE_JSON).then(jsonTxt=>{
     console.warn("App usage JSON at "+Const.APP_USAGE_JSON+" couldn't be parsed");
     return;
   }
+  appCounts.favs = 0;
   Object.keys(json.fav).forEach(key =>{
     if (appSortInfo[key]==undefined)
       appSortInfo[key] = {};
+    if (json.fav[key] > appCounts.favs) appCounts.favs = json.fav[key];
     appSortInfo[key].favourites = json.fav[key];
   });
+  appCounts.installs = 0;
   Object.keys(json.app).forEach(key =>{
     if (appSortInfo[key]==undefined)
       appSortInfo[key] = {};
+    if (json.app[key] > appCounts.installs) appCounts.installs = json.app[key];
     appSortInfo[key].installs = json.app[key];
   });
   document.querySelector(".sort-nav").classList.remove("hidden");
@@ -174,7 +189,8 @@ function showChangeLog(appid, installedVersion) {
   httpGet(`apps/${appid}/ChangeLog`).
     then(show).catch(()=>show("No Change Log available"));
 }
-function showReadme(appid) {
+function showReadme(event, appid) {
+  if (event) event.preventDefault();
   let app = appNameToApp(appid);
   let appPath = `apps/${appid}/`;
   let markedOptions = { baseUrl : appPath };
@@ -191,7 +207,17 @@ function getAppDescription(app) {
 }
 
 /** Setup IFRAME callbacks for handleCustomApp and handleInterface */
-function iframeSetup(iframe, interfaceType, messageHandler) {
+function iframeSetup(options) {
+  var iframe = options.iframe;
+  var modal = options.modal;
+  document.body.append(modal);
+  htmlToArray(modal.getElementsByTagName("a")).forEach(button => {
+    button.addEventListener("click",event => {
+      event.preventDefault();
+      modal.remove();
+      if (options.onClose) options.onClose("Window closed");
+    });
+  });
   // when iframe is loaded, call 'onInit' with info about the device
   iframe.addEventListener("load", function() {
     console.log("IFRAME loaded");
@@ -199,7 +225,10 @@ function iframeSetup(iframe, interfaceType, messageHandler) {
     otherwise pass to messageHandler because handleCustomApp may want to handle it */
     iframe.contentWindow.addEventListener("message",function(event) {
       let msg = event.data;
-      if (msg.type=="eval") {
+      if (msg.type=="close") {
+        modal.remove();
+        if (options.onClose) options.onClose("Window closed");
+      } else if (msg.type=="eval") {
         Puck.eval(msg.data, function(result) {
           iframe.contentWindow.postMessage({
             type : "evalrsp",
@@ -232,18 +261,20 @@ function iframeSetup(iframe, interfaceType, messageHandler) {
           });
         });
       } else if (msg.type=="writestorage") {
+        Progress.show({title:`Uploading ${JSON.stringify(msg.filename)}`,sticky:true});
         Comms.writeFile(msg.filename, msg.data).then(function() {
+          Progress.hide({sticky:true});
           iframe.contentWindow.postMessage({
             type : "writestoragersp",
             id : msg.id
           });
         });
-      } else if (messageHandler) messageHandler(event);
+      } else if (options.messageHandler) options.messageHandler(event);
     }, false);
     // send the 'init' message
     iframe.contentWindow.postMessage({
       type: "init",
-      expectedInterface: interfaceType,
+      expectedInterface: options.jsFile,
       data: device
     },"*");
   }, false);
@@ -272,17 +303,12 @@ function handleCustomApp(appTemplate) {
         </div>
       </div>
     </div>`);
-    document.body.append(modal);
-    htmlToArray(modal.getElementsByTagName("a")).forEach(button => {
-      button.addEventListener("click",event => {
-        event.preventDefault();
-        modal.remove();
-        reject("Window closed");
-      });
-    });
-
     let iframe = modal.getElementsByTagName("iframe")[0];
-    iframeSetup(iframe, "customize.js", function(event) {
+    iframeSetup({ iframe : iframe,
+                  modal : modal,
+                  jsFile : "customize.js",
+                  onClose: reject,
+                  messageHandler : function(event) {
       let msg = event.data;
       if (msg.type=="app") {
         let appFiles = msg.data;
@@ -309,7 +335,7 @@ function handleCustomApp(appTemplate) {
             reject('Upload failed, ' + err, 'error');
           });
       }
-    }, false);
+    }});
   });
 }
 
@@ -332,18 +358,14 @@ function handleAppInterface(app) {
         </div>
       </div>
     </div>`);
-    document.body.append(modal);
-    htmlToArray(modal.getElementsByTagName("a")).forEach(button => {
-      button.addEventListener("click",event => {
-        event.preventDefault();
-        modal.remove();
-        //reject("Window closed");
-      });
-    });
     let iframe = modal.getElementsByTagName("iframe")[0];
-    iframeSetup(iframe, "interface.js", function(event) {
+    iframeSetup({ iframe : iframe,
+                  modal : modal,
+                  jsFile : "interface.js",
+                  // onClose: reject, // we don't need to reject when the window is closed
+                  messageHandler : function(event) {
       // nothing custom needed in here
-    });
+    }});
     iframe.src = `apps/${app.id}/${app.interface}`;
   });
 }
@@ -352,11 +374,7 @@ function changeAppFavourite(favourite, app) {
   if (favourite) {
     SETTINGS.favourites = SETTINGS.favourites.concat([app.id]);
   } else {
-    if ([ "boot","setting"].includes(app.id)) {
-      showToast(app.name + ' is required, can\'t remove it' , 'warning');
-    }else {
-      SETTINGS.favourites = SETTINGS.favourites.filter(e => e != app.id);
-    }
+    SETTINGS.favourites = SETTINGS.favourites.filter(e => e != app.id);
   }
   saveSettings();
   refreshLibrary();
@@ -388,24 +406,25 @@ function getAppHTML(app, appInstalled, forInterface) {
     if ("object"==typeof info.modified)
       infoTxt.push(`Last update: ${(info.modified.toLocaleDateString())}`);
     if (info.installs)
-      infoTxt.push(`${info.installs} reported installs`);
+      infoTxt.push(`${info.installs} reported installs (${(info.installs / appCounts.installs * 100).toFixed(0)}%)`);
     if (info.favourites) {
-      infoTxt.push(`${info.favourites} users favourited`);
+      infoTxt.push(`${info.favourites} users favourited (${(info.favourites / appCounts.favs * 100).toFixed(0)}%)`);
       appFavourites = info.favourites;
     }
     if (infoTxt.length)
       versionTitle = `title="${infoTxt.join("\n")}"`;
   }
   if (versionInfo) versionInfo = ` <small ${versionTitle}>(${versionInfo})</small>`;
-  let readme = `<a class="c-hand" onclick="showReadme('${app.id}')">Read more...</a>`;
+  let appurl = window.location.origin + window.location.pathname + "?id=" + encodeURIComponent(app.id);
+  let readme = `<a class="c-hand" href="${appurl}&readme" onclick="showReadme(event,'${app.id}')">Read more...</a>`;
   let favourite = SETTINGS.favourites.find(e => e == app.id);
   let githubLink = Const.APP_SOURCECODE_URL ?
     `<a href="${Const.APP_SOURCECODE_URL}/${app.id}" target="_blank" class="link-github"><img src="core/img/github-icon-sml.png" alt="See the code on GitHub"/></a>` : "";
-  let appurl = window.location.origin + window.location.pathname + "?id=" + encodeURIComponent(app.id);
+
 
   let html = `<div class="tile column col-6 col-sm-12 col-xs-12 app-tile">
   <div class="tile-icon">
-    <figure class="avatar"><img src="apps/${app.icon?`${app.id}/${app.icon}`:"unknown.png"}" alt="${escapeHtml(app.name)}"></figure><br/>
+    <figure class="avatar"><img src="apps/${app.icon?`${app.id}/${app.icon}`:"unknown.png"}" alt="${escapeHtml(app.name)}"></figure>
   </div>
   <div class="tile-content">
     <p class="tile-title text-bold"><a name="${appurl}"></a>${escapeHtml(app.name)} ${versionInfo}</p>
@@ -418,14 +437,14 @@ function getAppHTML(app, appInstalled, forInterface) {
     <button class="btn btn-link btn-action btn-lg btn-favourite" appid="${app.id}" title="Favourite"><i class="icon icon-favourite${favourite?" icon-favourite-active":""}">${appFavourites?`<span>${appFavourites}</span>`:""}</i></button>
     <button class="btn btn-link btn-action btn-lg ${(appInstalled&&app.interface)?"":"d-hide"}" appid="${app.id}" title="Download data from app"><i class="icon icon-interface"></i></button>
     <button class="btn btn-link btn-action btn-lg ${app.allow_emulator?"":"d-hide"}" appid="${app.id}" title="Try in Emulator"><i class="icon icon-emulator"></i></button>
-    <button class="btn btn-link btn-action btn-lg ${version.canUpdate?"":"d-hide"}" appid="${app.id}" title="Update App"><i class="icon icon-refresh"></i></button>
+    <button class="btn btn-link btn-action btn-lg ${(SETTINGS.alwaysAllowUpdate && appInstalled) || version.canUpdate?"":"d-hide"}" appid="${app.id}" title="Update App"><i class="icon icon-refresh"></i></button>
     <button class="btn btn-link btn-action btn-lg ${(!appInstalled && !app.custom)?"":"d-hide"}" appid="${app.id}" title="Upload App"><i class="icon icon-upload"></i></button>
     <button class="btn btn-link btn-action btn-lg ${appInstalled?"":"d-hide"}" appid="${app.id}" title="Remove App"><i class="icon icon-delete"></i></button>
     <button class="btn btn-link btn-action btn-lg ${app.custom?"":"d-hide"}" appid="${app.id}" title="Customise and Upload App"><i class="icon icon-menu"></i></button>`;
   if (forInterface=="myapps") html += `
     <button class="btn btn-link btn-action btn-lg btn-favourite" appid="${app.id}" title="Favourite"><i class="icon icon-favourite${favourite?" icon-favourite-active":""}">${appFavourites?`<span>${appFavourites}</span>`:""}</i></button>
     <button class="btn btn-link btn-action btn-lg ${(appInstalled&&app.interface)?"":"d-hide"}" appid="${app.id}" title="Download data from app"><i class="icon icon-interface"></i></button>
-    <button class="btn btn-link btn-action btn-lg ${version.canUpdate?'':'d-hide'}" appid="${app.id}" title="Update App"><i class="icon icon-refresh"></i></button>
+    <button class="btn btn-link btn-action btn-lg ${(SETTINGS.alwaysAllowUpdate && appInstalled) || version.canUpdate?'':'d-hide'}" appid="${app.id}" title="Update App"><i class="icon icon-refresh"></i></button>
     <button class="btn btn-link btn-action btn-lg" appid="${app.id}" title="Remove App"><i class="icon icon-delete"></i></button>`;
   html += "</div>";
   if (forInterface=="library") {
@@ -465,6 +484,8 @@ function refreshSort(){
 // Refill the library with apps
 function refreshLibrary(options) {
   options = options||{};
+  // options.dontChangeSearchBox : bool  -> don't update the value in the search box
+  // options.showAll : bool  -> don't restrict the numbers of apps that are shown
   let panelbody = document.querySelector("#librarycontainer .panel-body");
   // Work out what we should be filtering, based on the URL
   let searchType = ""; // possible values: hash, chip, full, id
@@ -474,8 +495,8 @@ function refreshLibrary(options) {
     searchValue = decodeURIComponent(window.location.hash.slice(1)).toLowerCase();
     searchType = "hash";
   }
-  let searchParams = new URLSearchParams(window.location.search);
   if (window.location.search) {
+    let searchParams = new URLSearchParams(window.location.search);
     if (searchParams.has("id")) {
       searchValue = searchParams.get("id").toLowerCase();
       searchType = "id";
@@ -525,13 +546,10 @@ function refreshLibrary(options) {
         // If the type is NOT in the array below then the search will be tag-based instead
         // of type-based.
         const supportedMetadataTypes = ["clock", "widget", "launch", "textinput", "ram"];
-        searchResult = visibleApps.map(app => {
-          if (app.type && supportedMetadataTypes.includes(app.type.toLowerCase())) {
-            return { app:app, relevance:app.type.toLowerCase() == searchValue.toLowerCase() ? 1 : 0 }
-          } else {
-            return { app:app, relevance: (app.tags && app.tags.split(',').includes(searchValue)) ? 1 : 0 };
-          }
-        });
+        if (supportedMetadataTypes.includes(searchValue.toLowerCase()))
+          searchResult = visibleApps.map(app => ({ app:app, relevance: (app.type||"app").toLowerCase() == searchValue.toLowerCase() ? 1 : 0 }));
+        else
+          searchResult = visibleApps.map(app => ({ app:app, relevance: (app.tags && app.tags.split(',').includes(searchValue)) ? 1 : 0 }));
       }
     } else if (searchType === "hash") {
       sortedByRelevance = true;
@@ -560,7 +578,7 @@ function refreshLibrary(options) {
         }));
     }
     // Now finally, filter, sort based on relevance and set the search result
-    visibleApps = searchResult.filter(a => a.relevance>0).sort((a,b) => b.relevance - a.relevance).map(a => a.app);
+    visibleApps = searchResult.filter(a => a.relevance>0).sort((a,b) => (b.relevance-(0|b.sortorder)) - (a.relevance-(0|a.sortorder))).map(a => a.app);
   }
   // if not otherwise sorted, use 'sort by' option
   if (!sortedByRelevance)
@@ -574,10 +592,25 @@ function refreshLibrary(options) {
     } else throw new Error("Unknown sort type "+activeSort);
   }
 
+  var viewMoreText = "";
+  if (!options.showAll && visibleApps.length > Const.MAX_APPS_SHOWN) {
+    viewMoreText = `<div class="tile column col-6 col-sm-12 col-xs-12 app-tile" onclick="javascript:refreshLibrary({dontChangeSearchBox:true,showAll:true})" style="cursor: pointer;">
+    <div class="tile-icon">
+      <figure class="avatar"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAACXBIWXMAAAsTAAALEwEAmpwYAAACp0lEQVR4nO1Zu24TQRRd8Sig49Xw+AwQfAA/ABGg0CLSugNSk5A6CkaI8ANBoQBE6w4JaT2XGGfv7N67hU0oIA4tCc2g65CQrL141/sYW/hIR7J2R55z587jzlnHmWCCCTJjxZijdY+uKaRZpWkVkNeVph+g+ZdQfivNTXmnPHrkesFVY8wRxzY+E11SSAsKeQM0mzRUyF8A6claEFwsXbgKgnNK83OleSet8J5ANO8AUvWj550pRzyG00rTVlbhfdj5pOl2YcJd1z0OyC8KEG4Ok57VarVjOYv/ehKQ3hcvnv+sD3onfeY48uWJhwNB5JKJcqYN9ydSNaP48K418Xp/TdwaSrxsa4C8aT8A7rhan00dgOzzIyDe7K4HXkolXk7HPA6pHAPYBt+/kHz0kRZsi4ZezicSL0VWt06xL9hEsrAhRePAAKSqtC0W4uiHV5JMn1nrQnVMFnT4MEkAr20LhXi+GhyA5mbcH7jrvplbWjY37lfMzZmKmX+63H1WdDvYzwA1EgQQXypLB9en7x2iPCu6HewReTNJBmL3fxmpaIfyrOh2sJcB5O1MAUiaox1OzVQKbwfpAkg5haovC28HKafQPxexdCojN2hx5tkOUi7i1QTbmS2ujPVBBpofDAxATKcREGr6T6HwctJirm1bLPSQWondPHHM7AvmKOec/+ZCIxBHwLZw+MtFJy2azfZpQP4+AuI7Q/umdZ/v2A5AYTDlZIF4lWM1daKQe6iNS47S9DY3k1eMVvEqyxPPbz602yecPCGjUdLOtJi7vX4Q4lUWYTkqpG+ZF2yaLVbsvu4Bk1U80k8Z9UajdcopG3I6imM2XO1ELaX5cR3xvGMbUmSJ6SS+jVgfcvGQm52UI7ukLUBak3dSEktVORKfWSeYwBl//AaTJ2VUxIlIxgAAAABJRU5ErkJggg=="></figure>
+    </div>
+    <div class="tile-content">
+    <p class="tile-title text-bold">${Const.MAX_APPS_SHOWN} of ${visibleApps.length} apps shown</p>
+    <p class="tile-subtitle"> <a>Tap to show all apps</a></p>
+    </div>
+  </div>`
+    visibleApps = visibleApps.slice(0, Const.MAX_APPS_SHOWN-1);
+  }
+
+
   panelbody.innerHTML = visibleApps.map((app,idx) => {
     let appInstalled = device.appsInstalled.find(a=>a.id==app.id);
     return getAppHTML(app, appInstalled, "library");
-  }).join("");
+  }).join("\n") + viewMoreText;
   // set badge up top
   let tab = document.querySelector("#tab-librarycontainer a");
   tab.classList.add("badge");
@@ -597,7 +630,7 @@ function refreshLibrary(options) {
           console.error("No entrypoint found for "+appid);
           return;
         }
-        let baseurl = window.location.href;
+        let baseurl = window.location.href.replace(/\/[^/]*$/,"/");
         baseurl = baseurl.substr(0,baseurl.lastIndexOf("/"));
         let url = baseurl+"/apps/"+app.id+"/"+file.url;
         window.open(`https://espruino.com/ide/emulator.html?codeurl=${url}&upload`);
@@ -728,47 +761,65 @@ function customApp(app) {
   });
 }
 
-/// check for dependencies the app needs and install them if required
+/* check for dependencies the app needs and install them if required
+uploadOptions is an object, see AppInfo.checkDependencies for what can be in it
+*/
 function checkDependencies(app, uploadOptions) {
-  let promise = Promise.resolve();
-  if (app.dependencies) {
-    Object.keys(app.dependencies).forEach(dependency=>{
-      var dependencyType = app.dependencies[dependency];
-      function handleDependency(dependencyChecker) {
-        let found = device.appsInstalled.find(dependencyChecker);
-        if (found)
-          console.log(`Found dependency in installed app '${found.id}'`);
-        else {
-          let foundApps = appJSON.filter(dependencyChecker);
-          if (!foundApps.length) throw new Error(`Dependency of '${dependency}' listed, but nothing satisfies it!`);
-          console.log(`Apps ${foundApps.map(f=>`'${f.id}'`).join("/")} implements '${dependencyType}:${dependency}'`);
-          found = foundApps[0]; // choose first app in list
-          console.log(`Dependency not installed. Installing app id '${found.id}'`);
-          promise = promise.then(()=>new Promise((resolve,reject)=>{
-            console.log(`Install dependency '${dependency}':'${found.id}'`);
-            return Comms.uploadApp(found,{device:device}).then(appJSON => {
-              if (appJSON) device.appsInstalled.push(appJSON);
-              resolve();
+  uploadOptions = uploadOptions||{};
+  uploadOptions.apps = appJSON;
+  uploadOptions.device = device;
+  uploadOptions.language = LANGUAGE;
+  uploadOptions.showQuery = function(msg, appToRemove) {
+    return new Promise((resolve,reject) => {
+      let modal = htmlElement(`<div class="modal active">
+        <a href="#close" class="modal-overlay " aria-label="Close"></a>
+        <div class="modal-container">
+          <div class="modal-header">
+            <a href="#close" class="btn btn-clear float-right" aria-label="Close"></a>
+            <div class="modal-title h5">App Dependencies</div>
+          </div>
+          <div class="modal-body">
+            <div class="content">
+              ${msg}. What would you like to do?
+            </div>
+          </div>
+          <div class="modal-footer">
+            <a href="#" class="btn btn-primary btn-replace" btnType="replace">Replace</a>
+            <a href="#" class="btn btn-cancel">Cancel</a>
+            <a href="#" class="btn btn-keep">Keep Both</a>
+          </div>
+        </div>
+      </div>`);
+      document.body.append(modal);
+      htmlToArray(modal.getElementsByTagName("a")).forEach(button => {
+        button.addEventListener("click",event => {
+          event.preventDefault();
+          modal.remove();
+          if (event.target.classList.contains("btn-replace")) {
+            // replace the old one - just remove it
+            Comms.removeApp(appToRemove).then(() => {
+              device.appsInstalled = device.appsInstalled.filter(a=>a.id!=appToRemove.id);
+              resolve()
             });
-          }));
-        }
-      }
-
-      if (dependencyType=="type") {
-        console.log(`Searching for dependency on app TYPE '${dependency}'`);
-        handleDependency(app=>app.type==dependency);
-      } else if (dependencyType=="app") {
-        console.log(`Searching for dependency on app ID '${dependency}'`);
-        handleDependency(app=>app.id==dependency);
-      } else
-        throw new Error(`Dependency type '${dependencyType}' not supported`);
-
+          } else if (event.target.classList.contains("btn-keep")) {
+            // Keep both - we'll just continue as-is
+            resolve();
+          } else { // was probably close/cancel
+            reject("User cancelled");
+          }
+        });
+      });
     });
-  }
-  return promise;
+  };
+  uploadOptions.needsApp = (app,uploadOptions) => Comms.uploadApp(app,uploadOptions);
+  return AppInfo.checkDependencies(app, device, uploadOptions);
 }
 
-function updateApp(app) {
+/* Update an app to latest version.
+if options.noReset is true, don't reset the device before
+if options.noFinish is true, showUploadFinished isn't called (displaying the reboot message) */
+function updateApp(app, options) {
+  options = options||{};
   if (app.custom) return customApp(app);
   return Comms.getAppInfo(app).then(remove => {
     // remove = from appid.info, app = from apps.json
@@ -786,12 +837,12 @@ function updateApp(app) {
       data.storageFiles = data.storageFiles.filter(removeData)
     }
     remove.data = AppInfo.makeDataString(data)
-    return Comms.removeApp(remove, true);
+    return Comms.removeApp(remove, {containsFileList:true, noReset:options.noReset, noFinish:options.noFinish});
   }).then(()=>{
     showToast(`Updating ${app.name}...`);
     device.appsInstalled = device.appsInstalled.filter(a=>a.id!=app.id);
-    return checkDependencies(app);
-  }).then(()=>Comms.uploadApp(app,{device:device})
+    return checkDependencies(app,{checkForClashes:false});
+  }).then(()=>Comms.uploadApp(app,{device:device,language:LANGUAGE,noReset:options.noReset, noFinish:options.noFinish})
   ).then((appJSON) => {
     if (appJSON) device.appsInstalled.push(appJSON);
     showToast(app.name+" Updated!", "success");
@@ -929,7 +980,7 @@ function getInstalledApps(refresh) {
 <table class="table"><tbody>
   <tr><td><b>Device Type</b></td><td>${device.id}</td></tr>
   <tr><td><b>Firmware Version</b></td><td>${device.version}</td></tr>
-  <tr><td><b>Apps Installed</b></td><td>${(device.appsInstalled||[]).map(a=>a.id).join(", ")}</td></tr>
+  <tr><td><b>Apps Installed</b></td><td>${(device.appsInstalled || []).map(a => `${a.id} (${a.version})`).join(", ")}</td></tr>
 </tbody></table>`;
       }
     })
@@ -954,8 +1005,8 @@ function installMultipleApps(appIds, promptName) {
         let app = apps.shift();
         if (app===undefined) return resolve();
         Progress.show({title:`${app.name} (${appCount-apps.length}/${appCount})`,sticky:true});
-        checkDependencies(app,"skip_reset")
-          .then(()=>Comms.uploadApp(app,{device:device, skipReset:true}))
+        checkDependencies(app,{device:device, noReset:true, noFinish:true})
+          .then(()=>Comms.uploadApp(app,{device:device, language:LANGUAGE, noReset:true, noFinish:true}))
           .then((appJSON) => {
             Progress.hide({sticky:true});
             if (appJSON) device.appsInstalled.push(appJSON);
@@ -968,11 +1019,38 @@ function installMultipleApps(appIds, promptName) {
       }
       upload();
     });
-  }).then(()=>{
-    return Comms.setTime();
-  }).then(()=>{
+  }).then(()=> Comms.setTime()
+  ).then(()=> Comms.showUploadFinished()
+  ).then(()=>{
     showToast("Apps successfully installed!","success");
     return getInstalledApps(true);
+  });
+}
+
+function updateAllApps() {
+  let appsToUpdate = getAppsToUpdate({excludeCustomApps:true});
+  // get apps - don't auto-update custom apps since they need the
+  // customiser page running
+  let count = appsToUpdate.length;
+  if (!count) {
+    showToast("Update failed, no apps can be updated","error");
+    return;
+  }
+  function updater() {
+    if (!appsToUpdate.length) return Promise.resolve("Success");
+    let app = appsToUpdate.pop();
+    return updateApp(app, {noReset:true,noFinish:true}).then(function() {
+      return updater();
+    });
+  }
+  Comms.reset().then(_ =>
+    updater()
+  ).then(_ =>
+    Comms.showUploadFinished()
+  ).then(_ => {
+    showToast(`Updated ${count} apps`,"success");
+  }).catch(err => {
+    showToast("Update failed, "+err,"error");
   });
 }
 
@@ -996,26 +1074,7 @@ htmlToArray(document.querySelectorAll(".btn.refresh")).map(button => button.addE
   });
 }));
 htmlToArray(document.querySelectorAll(".btn.updateapps")).map(button => button.addEventListener("click", () => {
-  let appsToUpdate = getAppsToUpdate({excludeCustomApps:true});
-  // get apps - don't auto-update custom apps since they need the
-  // customiser page running
-  let count = appsToUpdate.length;
-  if (!count) {
-    showToast("Update failed, no apps can be updated","error");
-    return;
-  }
-  function updater() {
-    if (!appsToUpdate.length) return Promise.resolve("Success");
-    let app = appsToUpdate.pop();
-    return updateApp(app).then(function() {
-      return updater();
-    });
-  }
-  updater().then(msg => {
-    showToast(`Updated ${count} apps`,"success");
-  }).catch(err => {
-    showToast("Update failed, "+err,"error");
-  });
+  updateAllApps();
 }));
 connectMyDeviceBtn.addEventListener("click", () => {
   if (connectMyDeviceBtn.classList.contains('is-connected')) {
@@ -1097,7 +1156,9 @@ function settingsCheckbox(id, name) {
   });
 }
 settingsCheckbox("settings-pretokenise", "pretokenise");
+settingsCheckbox("settings-minify", "minify");
 settingsCheckbox("settings-settime", "settime");
+settingsCheckbox("settings-alwaysAllowUpdate", "alwaysAllowUpdate");
 loadSettings();
 
 let btn;
@@ -1144,9 +1205,76 @@ if (btn) btn.addEventListener("click",event=>{
 // Install all favourite apps in one go
 btn = document.getElementById("installfavourite");
 if (btn) btn.addEventListener("click",event=>{
-    const nonCustomFavourites = SETTINGS.favourites.filter(appId => appJSON.find(app => app.id === appId && !app.custom));
+    let nonCustomFavourites = SETTINGS.favourites.filter(appId => appJSON.find(app => app.id === appId && !app.custom));
+    const mustHave = [ "boot","setting" ]; // apps that we absolutely need installed
+    mustHave.forEach(id => {
+      if (!nonCustomFavourites.includes(id))
+        nonCustomFavourites.unshift(id);
+    });
     installMultipleApps(nonCustomFavourites, "favourite").catch(err=>{
     Progress.hide({sticky:true});
     showToast("App Install failed, "+err,"error");
+  });
+});
+
+// Create a new issue on github
+btn = document.getElementById("newGithubIssue");
+if (btn) btn.addEventListener("click", event => {
+  const urlTemplate = "https://github.com/espruino/BangleApps/issues/new?template=bangle-bug-report-custom-form.yaml&fwversion={version}&apps={apps}";
+  const apps = (device.appsInstalled || []).map(a => `${a.id} (${a.version})`).join("\n");
+  const version = device.connected ? device.version : "";
+
+  const url = urlTemplate.replace("{version}", encodeURIComponent(version)).replace("{apps}", encodeURIComponent(apps));
+
+  window.open(url, '_blank');
+});
+
+btn = document.getElementById("screenshot");
+if (btn) btn.addEventListener("click",event=>{
+  getInstalledApps(false).then(()=>{
+    if (device.id=="BANGLEJS"){
+      showPrompt("Screenshot","Screenshots are not supported on Bangle.js 1",{ok:1});
+    } else {
+      let url;
+      Progress.show({title:"Creating screenshot",interval:10,percent:"animate",sticky:true});
+      Comms.write("\x10g.dump();\n").then((s)=>{
+        let oImage = new Image();
+        oImage.onload = function(){
+          Progress.show({title:"Converting screenshot",percent:90,sticky:true});
+          let oCanvas = document.createElement('canvas');
+          oCanvas.width = oImage.width;
+          oCanvas.height = oImage.height;
+          let oCtx = oCanvas.getContext('2d');
+          oCtx.drawImage(oImage, 0, 0);
+          url = oCanvas.toDataURL();
+  
+          let screenshotHtml = `
+            <div style="text-align: center;">
+              <img align="center" src="${url}"></img>
+            </div>
+          `
+  
+          showPrompt("Save Screenshot?",screenshotHtml, undefined, false).then((r)=>{
+            Progress.show({title:"Saving screenshot",percent:99,sticky:true});
+            let link = document.createElement("a");
+            link.download = "screenshot.png";
+            link.target = "_blank";
+            link.href = url;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+          }).catch(()=>{
+          }).finally(()=>{
+            Progress.hide({sticky:true});
+          });
+        }
+        oImage.src = s.split("\n")[0];
+        Progress.hide({sticky:true});
+        Progress.show({title:"Screenshot done",percent:85,sticky:true});
+  
+      }, err=>{
+        showToast("Error creating screenshot: "+err,"error");
+      });
+    }
   });
 });

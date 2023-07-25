@@ -1,7 +1,8 @@
 // Node.js
 if ("undefined"!=typeof module) {
   Espruino = require("../lib/espruinotools.js");
-  heatshrink = require("../lib/heatshrink.js");
+  Utils = require("./utils.js");
+  heatshrink = require("../../webtools/heatshrink.js");
 }
 
 // How many bytes of code to we attempt to upload in one go?
@@ -40,6 +41,23 @@ function toJS(txt, options) {
   return js;
 }
 
+function translateString(options, app, value) {
+  let language = options.language;
+  // strip out formatting at beginning/end
+  let match = value.match(/^([.<>\- /\n/]*)([^<>!?]*?)([.<>!?\- /\n/]*)$/);
+  let textToTranslate = match ? match[2] : value;
+  // now translate
+  if (language[app.id] && language[app.id][textToTranslate]) {
+    return match[1]+language[app.id][textToTranslate]+match[3];
+  } else if (language.GLOBAL[textToTranslate]) {
+    return match[1]+language.GLOBAL[textToTranslate]+match[3];
+  } else {
+    // Unhandled translation...
+    //console.log("Untranslated ",tokenString);
+  }
+  return undefined; // no translation
+}
+
 // Translate any strings in the app that are prefixed with /*LANG*/
 // see https://github.com/espruino/BangleApps/issues/136
 function translateJS(options, app, code) {
@@ -52,22 +70,20 @@ function translateJS(options, app, code) {
     let tokenString = code.substring(tok.startIdx, tok.endIdx);
     if (tok.type=="STRING" && previousString.includes("/*LANG*/")) {
       previousString=previousString.replace("/*LANG*/","");
-      let language = options.language;
-      // strip out formatting at beginning/end
-      let match = tok.value.match(/^([.<>\- /\n/]*)([^<>!?]*?)([.<>!?\- /\n/]*)$/);
-      let textToTranslate = match ? match[2] : tok.value;
-      // now translate
-      if (language[app.id] && language[app.id][textToTranslate]) {
-        tokenString = JSON.stringify(match[1]+language[app.id][textToTranslate]+match[3]);
-      } else if (language.GLOBAL[textToTranslate]) {
-        tokenString = JSON.stringify(match[1]+language.GLOBAL[textToTranslate]+match[3]);
-      } else {
-        // Unhandled translation...
-        //console.log("Untranslated ",tokenString);
-      }
+      let translation = translateString(options,app, tok.value);
+      if (translation!==undefined)
+        tokenString = JSON.stringify(translation);
       // remap any chars that we don't think we can display in Espruino's
       // built in fonts.
-      tokenString = convertStringToISOLatin(tokenString);
+      tokenString = Utils.convertStringToISOLatin(tokenString);
+    } else if (tok.str.startsWith("`")) {
+      // it's a tempated String! scan all clauses inside it and re-run on the JS in those
+      var re = /\$\{[^}]*\}/g;
+      while ((match = re.exec(tokenString)) != null) {
+        var orig = match[0];
+        var replacement = translateJS(options, app, orig.slice(2,-1));
+        tokenString = tokenString.substr(0,match.index+2) + replacement + tokenString.substr(match.index + orig.length-1);
+      }
     }
     outjs += previousString+tokenString;
     lastIdx = tok.endIdx;
@@ -98,12 +114,34 @@ function parseJS(storageFile, options, app) {
       builtinModules.push("crypto");
     // add any modules that were defined for this app (no need to search for them!)
     builtinModules = builtinModules.concat(app.storage.map(f=>f.name).filter(name => name && !name.includes(".")));
+    // Check for modules in pre-installed apps?
+    if (options.device.appsInstalled)
+      options.device.appsInstalled.forEach(app => {
+        /* we can't use provides_modules here because these apps are loaded
+        from the app.info file which doesn't have it. Instead, look for files
+        with no extension listed in 'app.files'. */
+        if (!app.files) return;
+        app.files.split(",").forEach(file => {
+          if (file.length && !file.includes("."))
+            builtinModules.push(file);
+        });
+      });
+    // In some cases we can't minify!
+    let minify = options.settings.minify;
+    if (options.settings.minify) {
+      js = js.trim();
+      /* if we're uploading (function() {...}) code for app.settings.js then
+      minification destroys it because it doesn't have side effects. It's hard
+      to work around nicely, so disable minification in these cases */
+      if (js.match(/\(\s*function/) && js.match(/}\s*\)/))
+        minify = false;
+    }
     // TODO: we could look at installed app files and add any modules defined in those?
     return Espruino.transform(js, {
       SET_TIME_ON_WRITE : false,
       PRETOKENISE : options.settings.pretokenise,
       MODULE_URL : localModulesURL+"|https://www.espruino.com/modules",
-      //MINIFICATION_LEVEL : "ESPRIMA", // disable due to https://github.com/espruino/BangleApps/pull/355#issuecomment-620124162
+      MINIFICATION_LEVEL : minify ? "ESPRIMA" : undefined,
       builtinModules : builtinModules.join(",")
     }).then(content => {
       storageFile.content = content;
@@ -150,6 +188,12 @@ var AppInfo = {
   getFiles : (app,options) => {
     options = options||{};
     return new Promise((resolve,reject) => {
+      // translate app names
+      if (options.language) {
+        if (app.shortName)
+          app.shortName = translateString(options, app, app.shortName)||app.shortName;
+        app.name = translateString(options, app, app.name)||app.name;
+      }
       // Load all files
       let appFiles = [].concat(
         app.storage,
@@ -283,6 +327,121 @@ var AppInfo = {
     if (!data.storageFiles.length) { return data.dataFiles.join(',') }
     return [data.dataFiles.join(','),data.storageFiles.join(',')].join(';')
   },
+
+  /*
+    uploadOptions : {
+      apps : appJSON, - list of all apps from JSON
+      needsApp : function(app, uploadOptions) - returns a promise which resolves with the app object, this installs the given app
+      checkForClashes : bool - check for existing apps that may get in the way
+      showQuery : IF checkForClashes=true, showQuery(msg, appToRemove) returns a promise
+      ... PLUS what can be supplied to Comms.uploadApp
+        device, language, noReset, noFinish
+    }
+  */
+  checkDependencies : (app, device, uploadOptions) => {
+    uploadOptions = uploadOptions || {};
+    if (uploadOptions.checkForClashes === undefined)
+      uploadOptions.checkForClashes = true;
+    if (uploadOptions.apps === undefined)
+      uploadOptions.apps = appJSON;
+
+    let promise = Promise.resolve();
+    // Look up installed apps in our app JSON to get full info on them
+    let appJSONInstalled = device.appsInstalled.map(app => uploadOptions.apps.find(a=>a.id==app.id)).filter(app=>app!=undefined);
+    // Check for existing apps that might cause issues
+    if (uploadOptions.checkForClashes) {
+      if (app.provides_modules) {
+        app.provides_modules.forEach(module => {
+          let existing = appJSONInstalled.find(app =>
+            app.provides_modules && app.provides_modules.includes(module));
+          if (existing) {
+            let msg = `App "${app.name}" provides module "${module}" which is already provided by "${existing.name}"`;
+            promise = promise.then(() => uploadOptions.showQuery(msg, existing));
+          }
+        });
+      }
+      if (app.provides_widgets) {
+        app.provides_widgets.forEach(widget => {
+          let existing = appJSONInstalled.find(app =>
+            app.provides_widgets && app.provides_widgets.includes(widget));
+          if (existing) {
+            let msg = `App "${app.name}" provides widget type "${widget}" which is already provided by "${existing.name}"`;
+            promise = promise.then(() => uploadOptions.showQuery(msg, existing));
+          }
+        });
+      }
+      if (app.type=="launch") {
+        let existing = appJSONInstalled.find(app => app.type=="launch");
+        if (existing) {
+          let msg = `App "${app.name}" is a launcher but you already have "${existing.name}" installed`;
+          promise = promise.then(() => uploadOptions.showQuery(msg, existing));
+        }
+      }
+      if (app.type=="textinput") {
+        let existing = appJSONInstalled.find(app => app.type=="textinput");
+        if (existing) {
+          let msg = `App "${app.name}" handles Text Input but you already have "${existing.name}" installed`;
+          promise = promise.then(() => uploadOptions.showQuery(msg, existing));
+        }
+      }
+      if (app.type=="notify") {
+        let existing = appJSONInstalled.find(app => app.type=="notify");
+        if (existing) {
+          let msg = `App "${app.name}" handles Notifications but you already have "${existing.name}" installed`;
+          promise = promise.then(() => uploadOptions.showQuery(msg, existing));
+        }
+      }
+    }
+    // could check provides_widgets here, but hey, why can't the user have 2 battery widgets if they want?
+    // Check for apps which we may need to install
+    if (app.dependencies) {
+      Object.keys(app.dependencies).forEach(dependency=>{
+        var dependencyType = app.dependencies[dependency];
+        function handleDependency(dependencyChecker) {
+          // now see if we can find one matching our dependency
+          let found = appJSONInstalled.find(dependencyChecker);
+          if (found)
+            console.log(`Found dependency in installed app '${found.id}'`);
+          else {
+            let foundApps = uploadOptions.apps.filter(dependencyChecker);
+            if (!foundApps.length) throw new Error(`Dependency of '${dependency}' listed, but nothing satisfies it!`);
+            console.log(`Apps ${foundApps.map(f=>`'${f.id}'`).join("/")} implements '${dependencyType}:${dependency}'`);
+            found = foundApps.find(app => app.default);
+            if (!found) {
+              console.warn("Looking for dependency, but no default app found - using first in list");
+              found = foundApps[0]; // choose first app in list
+            }
+            console.log(`Dependency not installed. Installing app id '${found.id}'`);
+            promise = promise.then(()=>new Promise((resolve,reject)=>{
+              console.log(`Install dependency '${dependency}':'${found.id}'`);
+              return AppInfo.checkDependencies(found, device, uploadOptions)
+                     .then(() => uploadOptions.needsApp(found, uploadOptions))
+                     .then(appJSON => {
+                if (appJSON) device.appsInstalled.push(appJSON);
+                resolve();
+              });
+            }));
+          }
+        }
+
+        if (dependencyType=="type") {
+          console.log(`Searching for dependency on app TYPE '${dependency}'`);
+          handleDependency(app=>app.type==dependency);
+        } else if (dependencyType=="app") {
+          console.log(`Searching for dependency on app ID '${dependency}'`);
+          handleDependency(app=>app.id==dependency);
+        } else if (dependencyType=="module") {
+          console.log(`Searching for dependency for module '${dependency}'`);
+          handleDependency(app=>app.provides_modules && app.provides_modules.includes(dependency));
+        } else if (dependencyType=="widget") {
+          console.log(`Searching for dependency for widget '${dependency}'`);
+          handleDependency(app=>app.provides_widgets && app.provides_widgets.includes(dependency));
+        } else
+          throw new Error(`Dependency type '${dependencyType}' not supported`);
+      });
+    }
+    return promise;
+  }
 };
 
 if ("undefined"!=typeof module)

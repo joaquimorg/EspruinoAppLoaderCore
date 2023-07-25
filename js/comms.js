@@ -45,6 +45,9 @@ const Comms = {
       if (result=="" && (tries-- > 0)) {
         console.log(`<COMMS> reset: no response. waiting ${tries}...`);
         Puck.write("\x03",rstHandler);
+      } else if (result.endsWith("debug>")) {
+        console.log(`<COMMS> reset: watch in debug mode, interrupting...`);
+        Puck.write("\x03",rstHandler);
       } else {
         console.log(`<COMMS> reset: rebooted - sending commands to clear out any boot code`);
         // see https://github.com/espruino/BangleApps/issues/1759
@@ -127,14 +130,15 @@ const Comms = {
       uploadCmd()
     });
   },
-  // Upload an app
+  /** Upload an app
+     app : an apps.json structure (i.e. with `storage`)
+     options : { device : { id : ..., version : ... } info about the currently connected device
+                 language : object of translations, eg 'lang/de_DE.json'
+                 noReset : if true, don't reset the device before
+                 noFinish : if true, showUploadFinished isn't called (displaying the reboot message)
+     } */
   uploadApp : (app,options) => {
     options = options||{};
-    /* app : an apps.json structure (i.e. with `storage`)
-       options : { skipReset : bool, // don't reset first
-                   device : { id : ..., version : ... } info about the currently connected device
-                   language : object of translations, eg 'lang/de_DE.json'
-       } */
     Progress.show({title:`Uploading ${app.name}`,sticky:true});
     return AppInfo.getFiles(app, {
       fileGetter : httpGet,
@@ -159,7 +163,7 @@ const Comms = {
         function doUploadFiles() {
         // No files left - print 'reboot' message
           if (fileContents.length==0) {
-            Comms.showUploadFinished().then(() => {
+            (options.noFinish ? Promise.resolve() : Comms.showUploadFinished()).then(() => {
               Progress.hide({sticky:true});
               resolve(appInfo);
             }).catch(function() {
@@ -183,7 +187,7 @@ const Comms = {
               return reject("");
             });
         }
-        if (options.skipReset) {
+        if (options.noReset) {
           doUpload();
         } else {
         // reset to ensure we have enough memory to upload what we need to
@@ -201,6 +205,29 @@ const Comms = {
           Progress.hide({sticky:true});
           return reject("");
         }
+
+        let interrupts = 0;
+        const checkCtrlC = result => {
+          if (result.endsWith("debug>")) {
+            if (interrupts > 3) {
+              console.log("<COMMS> can't interrupt watch out of debug mode, giving up.", result);
+              reject("");
+              return;
+            }
+            console.log("<COMMS> watch was in debug mode, interrupting.", result);
+            // we got a debug prompt - we interrupted the watch while JS was executing
+            // so we're in debug mode, issue another ctrl-c to bump the watch out of it
+            Puck.write("\x03", checkCtrlC);
+            interrupts++;
+          } else {
+            resolve(result);
+          }
+        };
+
+        checkCtrlC(result);
+      });
+    }).
+      then((result) => new Promise((resolve, reject) => {
         console.log("<COMMS> Ctrl-C gave",JSON.stringify(result));
         if (result.includes("ERROR") && !noReset) {
           console.log("<COMMS> Got error, resetting to be sure.");
@@ -251,8 +278,7 @@ const Comms = {
           console.log("<COMMS> getDeviceInfo", info);
           resolve(info);
         }, true /* callback on newline */);
-      });
-    });
+      }));
   },
   // Get an app's info file from Bangle.js
   getAppInfo : app => {
@@ -270,48 +296,50 @@ const Comms = {
         return app;
       });
   },
-  // Remove an app given an appinfo.id structure as JSON
-  removeApp : (app, containsFileList) => {
-    // expects an appid.info structure with minimum app.id
-    // if containsFileList is true, don't get data from watch
+  /** Remove an app given an appinfo.id structure as JSON
+  expects an appid.info structure with minimum app.id
+  if options.containsFileList is true, don't get data from watch
+  if options.noReset is true, don't reset the device before
+  if options.noFinish is true, showUploadFinished isn't called (displaying the reboot message)   */
+  removeApp : (app, options) => {
+    options = options||{};
     Progress.show({title:`Removing ${app.id}`,sticky:true});
     /* App Info now doesn't contain .files, so to erase, we need to
     read the info file ourselves. */
-    return Comms.reset().
+    return (options.noReset ? Promise.resolve() : Comms.reset()).
       then(()=>Comms.showMessage(`Erasing\n${app.id}...`)).
-      then(()=>containsFileList ? app : Comms.getAppInfo(app)).
+      then(()=>options.containsFileList ? app : Comms.getAppInfo(app)).
       then(app=>{
-        let cmds = '\x10const s=require("Storage");\n';
+        let cmds = '';
         // remove App files: regular files, exact names only
         if ("string"!=typeof app.files) {
           console.warn("App file "+app.id+".info doesn't have a 'files' field");
           app.files=app.id+".info";
         }
-        cmds += app.files.split(',').filter(f=>f!="").map(file => `\x10s.erase(${toJS(file)});\n`).join("");
+        cmds += app.files.split(',').filter(f=>f!="").map(file => `\x10require("Storage").erase(${toJS(file)});\n`).join("");
         // remove app Data: (dataFiles and storageFiles)
         const data = AppInfo.parseDataString(app.data)
         const isGlob = f => /[?*]/.test(f)
         //   regular files, can use wildcards
         cmds += data.dataFiles.map(file => {
-          if (!isGlob(file)) return `\x10s.erase(${toJS(file)});\n`;
+          if (!isGlob(file)) return `\x10require("Storage").erase(${toJS(file)});\n`;
           const regex = new RegExp(globToRegex(file))
-          return `\x10s.list(${regex}).forEach(f=>s.erase(f));\n`;
+          return `\x10require("Storage").list(${regex}).forEach(f=>require("Storage").erase(f));\n`;
         }).join("");
         //   storageFiles, can use wildcards
         cmds += data.storageFiles.map(file => {
-          if (!isGlob(file)) return `\x10s.open(${toJS(file)},'r').erase();\n`;
+          if (!isGlob(file)) return `\x10require("Storage").open(${toJS(file)},'r').erase();\n`;
           // storageFiles have a chunk number appended to their real name
           const regex = globToRegex(file+'\u0001')
           // open() doesn't want the chunk number though
-          let cmd = `\x10s.list(${regex}).forEach(f=>s.open(f.substring(0,f.length-1),'r').erase());\n`
+          let cmd = `\x10require("Storage").list(${regex}).forEach(f=>require("Storage").open(f.substring(0,f.length-1),'r').erase());\n`
           // using a literal \u0001 char fails (not sure why), so escape it
           return cmd.replace('\u0001', '\\x01')
         }).join("");
         console.log("<COMMS> removeApp", cmds);
-
-        return Comms.write(cmds)
+        if (cmds!="") return Comms.write(cmds);
       }).
-      then(()=>Comms.showUploadFinished()).
+      then(()=>options.noFinish ? Promise.resolve() : Comms.showUploadFinished()).
       then(()=>Progress.hide({sticky:true})).
       catch(function(reason) {
         Progress.hide({sticky:true});
@@ -358,7 +386,7 @@ const Comms = {
       let cmd = '\x10setTime('+(d.getTime()/1000)+');';
       // in 1v93 we have timezones too
       cmd += 'E.setTimeZone('+tz+');';
-      cmd += "(s=>{s&&(s.timezone="+tz+")&&require('Storage').write('setting.json',s);})(require('Storage').readJSON('setting.json',1))\n";
+      cmd += "(s=>s&&(s.timezone="+tz+",require('Storage').write('setting.json',s)))(require('Storage').readJSON('setting.json',1))\n";
       Comms.write(cmd);
     });
   },
