@@ -72,7 +72,7 @@ let DEVICEINFO = [
     id : "PINETIME40",
     name : "PineTime 40",
     features : ["BLE","BLEHID","GRAPHICS","ACCEL","TOUCH"],
-    img : "https://www.joaquim.org/wp-content/uploads/2023/06/IMG_20230630_163613-920x422.jpg"
+    img : "https://www.pine64.org/wp-content/uploads/2021/06/pinetime-slider-v2.png"
   }
 ];
 
